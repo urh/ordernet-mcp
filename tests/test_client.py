@@ -171,7 +171,7 @@ def test_authenticate_missing_token_raises():
 
 def test_unsupported_broker_rejected():
     with pytest.raises(ValueError, match="unsupported broker"):
-        OrdernetReadOnlyClient("ibi")
+        OrdernetReadOnlyClient("fakebroker")
 
 
 def test_get_accounts_parses_static_data_shape():
@@ -253,7 +253,7 @@ def test_load_credentials_rejects_fill_me_password(tmp_path):
 
 def test_load_credentials_rejects_unknown_broker(tmp_path):
     p = tmp_path / "creds.json"
-    p.write_text(json.dumps({"broker": "ibi", "accounts": [{"username": "u", "password": "p"}]}))
+    p.write_text(json.dumps({"broker": "fakebroker", "accounts": [{"username": "u", "password": "p"}]}))
     with pytest.raises(OrdernetError, match="bad broker"):
         load_credentials(p)
 

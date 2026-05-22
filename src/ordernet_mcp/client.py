@@ -45,7 +45,7 @@ DEFAULT_CRED_PATH = Path(
         str(Path.home() / ".config" / "ordernet" / "credentials.json"),
     )
 )
-SUPPORTED_BROKERS = frozenset({"meitav", "psagot", "nesua"})
+SUPPORTED_BROKERS = frozenset({"meitav", "psagot", "ibi"})
 
 # The allowlist that turns this from "client" into "read-only client".
 # Every method that hits the network MUST resolve to one of these paths.

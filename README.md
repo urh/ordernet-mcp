@@ -1,6 +1,6 @@
 # ordernet-mcp
 
-Read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for **Ordernet / Spark** — the online trading platform used by Israeli brokers such as Meitav, Psagot, and Nesua.
+Read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for **Ordernet / Spark** — the online trading platform used by Israeli brokers such as Meitav, Psagot, and IBI.
 
 **Author:** [Uri Harduf](https://github.com/urh)
 
@@ -38,7 +38,7 @@ chmod 600 ~/.config/ordernet/credentials.json
 
 For Spark/Meitav, the login username is usually your account number, so you can omit `username` and set only `account_number`.
 
-Supported brokers: `meitav`, `psagot`, `nesua`.
+Supported brokers: `meitav`, `psagot`, `ibi`.
 
 ### 2. Install
 
