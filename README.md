@@ -12,8 +12,9 @@ Connect an AI assistant (Cursor, Claude Desktop, etc.) to your brokerage account
 - *"How much cash do I have available to invest?"*
 - *"List my current stock and ETF holdings with market values."*
 - *"When did that large deposit arrive, and how much did we transfer in this year?"*
+- *"What was the account worth at the end of each month last year?"*
 
-The server is **read-only by construction**: it can authenticate and fetch balances, holdings and transaction history, but cannot place trades, cancel orders, or move money. Every HTTP path goes through an explicit allowlist enforced in code and tests.
+The server is **read-only by construction**: it can authenticate and fetch balances, holdings, transaction history and monthly statements, but cannot place trades, cancel orders, or move money. Every HTTP path goes through an explicit allowlist enforced in code and tests.
 
 ## Tools
 
@@ -23,8 +24,10 @@ The server is **read-only by construction**: it can authenticate and fetch balan
 | `get_total_cash` | NIS cash balance only |
 | `get_current_stocks` | Per-instrument holdings with quantities and values |
 | `get_transactions` | Transaction history for a date range — deposits, transfers, trades, conversions, dividends, fees — with signed amounts and the cash balance after each row. `cash_movements_only` narrows it to money in / out |
+| `list_statements` | Which monthly account statements (and yearly tax reports) exist |
+| `get_statement` | One monthly statement: the portfolio value at month end, plus its holdings and transactions as text (needs `pypdf`: `pip install -e ".[pdf]"`) |
 
-All tools accept an optional `account_label` to filter to one account from your credentials file. `get_transactions` also takes `start_date` / `end_date` (YYYY-MM-DD; default: January 1 → today).
+All tools accept an optional `account_label` to filter to one account from your credentials file. `get_transactions` also takes `start_date` / `end_date` (YYYY-MM-DD; default: January 1 → today); `get_statement` takes `year` and `month`.
 
 ## Setup
 

@@ -16,7 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
+pdf = ["pypdf>=4.0"]
+dev = ["pytest>=8.0.0", "pypdf>=4.0"]
 
 [project.scripts]
 ordernet-mcp = "ordernet_mcp.server:main"

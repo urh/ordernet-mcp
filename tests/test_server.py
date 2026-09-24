@@ -25,6 +25,8 @@ from ordernet_mcp.client import (
     Holding,
     OrdernetReadOnlyClient,
     SecuritiesTotals,
+    Statement,
+    StatementSummary,
     Transaction,
 )
 
@@ -36,10 +38,11 @@ def _run(coro):
 # =========================================================== surface invariants
 
 
-def test_tool_names_are_exactly_the_four_read_tools():
+def test_tool_names_are_exactly_the_six_read_tools():
     tools = _run(ordernet_mcp.list_tools())
     names = sorted(t.name for t in tools)
-    assert names == ["get_current_stocks", "get_total_amount", "get_total_cash", "get_transactions"], names
+    assert names == ["get_current_stocks", "get_statement", "get_total_amount", "get_total_cash",
+                     "get_transactions", "list_statements"], names
 
 
 def test_tool_descriptions_advertise_read_only():
@@ -161,6 +164,12 @@ def stub_spark(monkeypatch):
         client.get_securities.return_value = f["totals"]
         client.get_holdings.return_value = f["holdings"]
         client.get_transaction_history.return_value = f.get("txns", [])
+        client.list_statements.return_value = [
+            Statement(id="S1", year=2026, month=1, kind="Statement", token="tok1"),
+            Statement(id="S2", year=2026, month=2, kind="Statement", token="tok2"),
+            Statement(id="T1", year=2025, month=0, kind="TaxReport"),
+        ]
+        client.download_statement.return_value = b"%PDF-fake"
 
         spark_account = Account(
             key=f"ACC_001-{num}",
@@ -319,3 +328,33 @@ def test_get_transactions_rejects_bad_dates(fake_creds, stub_spark):
     rev = _run(ordernet_mcp.call_tool("get_transactions", {
         "start_date": "2026-05-01", "end_date": "2026-01-01"}))
     assert "before start_date" in rev[0].text
+
+
+# =========================================================== statements
+
+
+def test_list_statements_groups_monthly_and_other(fake_creds, stub_spark):
+    out = _run(ordernet_mcp.call_tool("list_statements", {"account_label": "primary"}))
+    text = out[0].text
+    assert "2026-01, 2026-02" in text
+    assert "TaxReport 2025" in text
+
+
+def test_get_statement_returns_month_end_total(fake_creds, stub_spark, monkeypatch):
+    monkeypatch.setattr(ordernet_mcp, "parse_statement",
+                        lambda pdf: StatementSummary(as_of="2026-02-28", total_ils=123456.78, text="holdings..."))
+    out = _run(ordernet_mcp.call_tool("get_statement", {"account_label": "primary", "year": 2026, "month": 2}))
+    text = out[0].text
+    p = json.loads(text.split("```json")[1].split("```")[0])
+    assert p["as_of"] == "2026-02-28" and p["total_ils"] == 123456.78
+    assert "holdings..." in text
+    lean = _run(ordernet_mcp.call_tool("get_statement", {"account_label": "primary", "year": 2026,
+                                                          "month": 2, "include_text": False}))
+    assert "holdings..." not in lean[0].text
+
+
+def test_get_statement_missing_month(fake_creds, stub_spark):
+    out = _run(ordernet_mcp.call_tool("get_statement", {"account_label": "primary", "year": 2026, "month": 9}))
+    assert "no statement for that month" in out[0].text
+    bad = _run(ordernet_mcp.call_tool("get_statement", {"account_label": "primary"}))
+    assert "year and month are required" in bad[0].text

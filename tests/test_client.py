@@ -478,3 +478,87 @@ def test_get_transaction_history_rejects_reversed_range():
     c._token = "x"
     with pytest.raises(ValueError):
         c.get_transaction_history(Account(key="k", number="1", name=""), date(2026, 2, 1), date(2026, 1, 1))
+
+
+# ============================== statements
+
+
+def test_statement_paths_are_allowlisted_and_file_path_is_separate():
+    from ordernet_mcp.client import _ALLOWED_FILE_PATHS
+    assert "Account/GetAccountReports" in _ALLOWED_GET_PATHS
+    assert _ALLOWED_FILE_PATHS == frozenset({"GetFile"})
+    for f in ["Order", "Trade", "Cancel", "Submit", "Place"]:
+        assert all(f.lower() not in p.lower() for p in _ALLOWED_FILE_PATHS)
+
+
+def test_get_file_refuses_other_paths(monkeypatch):
+    c = OrdernetReadOnlyClient("meitav")
+    calls = []
+    monkeypatch.setattr(c._session, "get", lambda *a, **k: calls.append(a) or _mock_response(200, {}))
+    with pytest.raises(OrdernetSecurityError):
+        c._get_file("Order/Place", {})
+    assert calls == []
+
+
+def test_list_and_download_statement(monkeypatch):
+    from ordernet_mcp.client import Statement
+    c = OrdernetReadOnlyClient("meitav")
+    c._token = "x"
+    reports = [
+        {"_t": "AccountReport", "a": "S2", "b": 2026, "c": 2, "d": "Statement", "f": "tok2"},
+        {"_t": "AccountReport", "a": "T1", "b": 2025, "d": "TaxReport"},
+        {"_t": "AccountReport", "a": "S1", "b": 2026, "c": 1, "d": "Statement", "f": "tok1"},
+    ]
+    seen = []
+
+    def fake_get(url, params=None, **kw):
+        seen.append((url, dict(params or {}), kw.get("headers")))
+        if url.endswith("/api/Account/GetAccountReports"):
+            return _mock_response(200, reports)
+        r = _mock_response(200, {})
+        r.content = b"%PDF-1.4 fake"
+        return r
+
+    monkeypatch.setattr(c._session, "get", fake_get)
+    acc = Account(key="ACC_000-1", number="1", name="")
+    stmts = c.list_statements(acc)
+    assert [(s.year, s.month, s.kind) for s in stmts] == [(2025, 0, "TaxReport"), (2026, 1, "Statement"), (2026, 2, "Statement")]
+    assert not stmts[0].downloadable and stmts[2].downloadable
+    assert "tok2" not in repr(stmts[2])  # the per-file token stays out of logs
+
+    assert c.download_statement(acc, stmts[2]).startswith(b"%PDF")
+    url, params, headers = seen[-1]
+    assert url == c.api_url.rsplit("/api", 1)[0] + "/GetFile"
+    assert params["id"] == "S2" and params["token"] == "tok2" and params["Year"] == "2026"
+    assert headers is None  # the file token authorizes it; no bearer sent
+    with pytest.raises(OrdernetError):
+        c.download_statement(acc, stmts[0])
+
+
+def test_download_statement_rejects_non_pdf(monkeypatch):
+    from ordernet_mcp.client import Statement
+    c = OrdernetReadOnlyClient("meitav")
+    r = _mock_response(200, {})
+    r.content = b"<html>login</html>"
+    monkeypatch.setattr(c._session, "get", lambda *a, **k: r)
+    with pytest.raises(OrdernetError):
+        c.download_statement(Account(key="k", number="1", name=""),
+                             Statement(id="S", year=2026, month=1, kind="Statement", token="t"))
+
+
+def test_summarize_statement_text():
+    from ordernet_mcp.client import summarize_statement_text
+    text = (
+        "הננו מתכבדים להציג את תיק השקעותיך אצלנו נכון ליום : 28/02/2026\n"
+        "פירוט תיק השקעות\n"
+        "60.00 600,000.00 10.00 1,000.00545,454.55 600.00 SOME ETF 1234567\n"
+        "100.00 *\n 1,000,000.50\n סה\"כ\n"
+        "פירוט תנועות בחשבון\n"
+        "\nOverall\nregulatory appendix"
+    )
+    s = summarize_statement_text(text)
+    assert s.as_of == "2026-02-28"
+    assert s.total_ils == 1000000.50
+    assert "regulatory appendix" not in s.text and "SOME ETF" in s.text
+    empty = summarize_statement_text("nothing here")
+    assert empty.as_of is None and empty.total_ils is None

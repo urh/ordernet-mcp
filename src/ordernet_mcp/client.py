@@ -27,13 +27,18 @@ Endpoints in scope (all read):
 - ``Account/GetAccountTransactions`` - historical transactions (raw)
 - ``Account/GetNewAccountTransactions`` - transaction history as the
   web UI shows it (currency, signed amount, cash balance after)
+- ``Account/GetAccountReports`` - the list of monthly statements
+- ``GetFile`` (outside ``/api``) - one statement PDF, authorized by
+  the per-file token that ``GetAccountReports`` hands out
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import date, datetime
 import os
 from pathlib import Path
@@ -60,6 +65,13 @@ _ALLOWED_GET_PATHS = frozenset({
     "Account/GetHoldingsSummery",
     "Account/GetAccountTransactions",
     "Account/GetNewAccountTransactions",
+    "Account/GetAccountReports",
+})
+
+# Document downloads live outside ``/api``. Same rule: GET only, and only
+# these paths.
+_ALLOWED_FILE_PATHS = frozenset({
+    "GetFile",
 })
 
 # The only POST we ever issue. Inlined in `authenticate`; not callable
@@ -223,6 +235,63 @@ def _parse_transaction(row: dict[str, Any]) -> Transaction:
         cash_balance_ils=_num(row, "t"),
         raw=row,
     )
+
+
+@dataclass(frozen=True)
+class Statement:
+    """One entry of ``GetAccountReports``.
+
+    - ``id`` <- ``a``; ``year`` <- ``b``; ``month`` <- ``c`` (0 for
+      yearly reports)
+    - ``kind`` <- ``d``: "Statement" (monthly) or "TaxReport" (yearly)
+    - ``token`` <- ``f``, authorizes the ``GetFile`` download of this
+      document; only monthly statements carry one
+    """
+
+    id: str
+    year: int
+    month: int
+    kind: str
+    token: str = field(repr=False, default="")
+
+    @property
+    def downloadable(self) -> bool:
+        return self.kind == "Statement" and bool(self.token)
+
+
+@dataclass(frozen=True)
+class StatementSummary:
+    """What we read off a monthly statement PDF."""
+
+    as_of: str | None        # YYYY-MM-DD, "נכון ליום"
+    total_ils: float | None  # portfolio value on that day ("סה\"כ")
+    text: str                # the account pages (holdings + transactions)
+
+
+_NUM = r"\d{1,3}(?:,\d{3})*\.\d{2}"
+
+
+def summarize_statement_text(text: str) -> StatementSummary:
+    """Pull the as-of date and total value out of a statement's text."""
+    m = re.search(r"נכון ליום\s*:\s*(\d{2})/(\d{2})/(\d{4})", text)
+    t = re.search(r"100\.00\s*\*\s*(" + _NUM + r")\s*סה\"כ", text)
+    # The account pages end where the regulatory appendix starts.
+    cut = text.find("\nOverall")
+    return StatementSummary(
+        as_of=f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else None,
+        total_ils=float(t.group(1).replace(",", "")) if t else None,
+        text=text[:cut] if cut > 0 else text,
+    )
+
+
+def parse_statement(pdf: bytes) -> StatementSummary:
+    """Text-extract a statement PDF (needs ``pypdf``) and summarize it."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as e:
+        raise OrdernetError("reading statements needs pypdf (pip install pypdf)") from e
+    pages = [p.extract_text() or "" for p in PdfReader(io.BytesIO(pdf)).pages]
+    return summarize_statement_text("\n".join(pages))
 
 
 class OrdernetReadOnlyClient:
@@ -507,6 +576,61 @@ class OrdernetReadOnlyClient:
         # ``z1`` is Spark's running sequence number within the response.
         out.sort(key=lambda t: (t.date, _num(t.raw, "z1")))
         return out
+
+    # ---------------------------------------------------------- statements
+
+    def list_statements(self, account: Account) -> list[Statement]:
+        """Monthly statements (and yearly tax reports), oldest first."""
+        data = self._get("Account/GetAccountReports", {"accountKey": account.key})
+        if not isinstance(data, list):
+            raise OrdernetError(
+                f"GetAccountReports returned non-list: {type(data).__name__}"
+            )
+        out = [
+            Statement(
+                id=str(r.get("a") or ""),
+                year=int(r.get("b") or 0),
+                month=int(r.get("c") or 0),
+                kind=str(r.get("d") or ""),
+                token=str(r.get("f") or ""),
+            )
+            for r in data
+        ]
+        return sorted(out, key=lambda s: (s.year, s.month, s.kind))
+
+    def _get_file(self, path: str, params: dict) -> bytes:
+        if path not in _ALLOWED_FILE_PATHS:
+            raise OrdernetSecurityError(
+                f"refusing to GET {path!r}: not in read-only file allowlist "
+                f"({sorted(_ALLOWED_FILE_PATHS)})"
+            )
+        base = self.api_url.rsplit("/api", 1)[0]
+        r = self._session.get(f"{base}/{path}", params=params, timeout=self._timeout)
+        if r.status_code != 200:
+            raise OrdernetError(f"{path} failed: {r.status_code}")
+        return r.content
+
+    def download_statement(self, account: Account, statement: Statement) -> bytes:
+        """The PDF of one monthly statement."""
+        if not statement.downloadable:
+            raise OrdernetError(
+                f"{statement.kind} {statement.year}/{statement.month} has no download token"
+            )
+        pdf = self._get_file("GetFile", {
+            "isSpark": "true",
+            "isStatement": "true",
+            "t": "s",
+            "id": statement.id,
+            "language": "he",
+            "token": statement.token,
+            "IsAccessible": "False",
+            "DocumentType": "1",
+            "AccountNumber": account.key,
+            "Year": str(statement.year),
+        })
+        if not pdf.startswith(b"%PDF"):
+            raise OrdernetError("GetFile did not return a PDF")
+        return pdf
 
 
 # ---------------------------------------------------------- credentials helpers

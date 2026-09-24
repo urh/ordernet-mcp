@@ -1,12 +1,14 @@
 """Read-only Ordernet MCP server (stdio).
 
-Exposes four read tools backed by ``bot.ordernet.OrdernetReadOnlyClient``:
+Exposes six read tools backed by ``bot.ordernet.OrdernetReadOnlyClient``:
 
 - ``get_total_amount`` - total equity (cash + securities) per account
 - ``get_total_cash``   - just the NIS cash balance
 - ``get_current_stocks`` - per-instrument holdings
 - ``get_transactions`` - transaction history (deposits, transfers,
   trades, dividends, fees) for a date range
+- ``list_statements`` - which monthly statements exist
+- ``get_statement`` - one monthly statement: month-end value + text
 
 What this server does NOT do, and is structurally incapable of doing:
 
@@ -49,6 +51,7 @@ from ordernet_mcp.client import (
     SecuritiesTotals,
     Transaction,
     load_credentials,
+    parse_statement,
 )
 
 log = logging.getLogger(__name__)
@@ -251,6 +254,49 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="list_statements",
+            description=(
+                "READ-ONLY. The monthly account statements (and yearly tax "
+                "reports) Spark has for one or all configured accounts, by "
+                "year and month. Use get_statement to read one."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account_label": {
+                        "type": "string",
+                        "description": _LABEL_DESCRIPTION,
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_statement",
+            description=(
+                "READ-ONLY. One monthly account statement: the portfolio "
+                "value on the last day of the month, plus the statement's "
+                "text - holdings (quantity, cost, value, % gain) and that "
+                "month's transactions. Good for what an account was worth "
+                "at the end of a past month."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account_label": {
+                        "type": "string",
+                        "description": _LABEL_DESCRIPTION,
+                    },
+                    "year": {"type": "integer", "description": "e.g. 2026"},
+                    "month": {"type": "integer", "description": "1-12"},
+                    "include_text": {
+                        "type": "boolean",
+                        "description": "Include the statement text (default true). False returns only the month-end value.",
+                    },
+                },
+                "required": ["year", "month"],
+            },
+        ),
     ]
 
 
@@ -266,6 +312,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _do_current_stocks(label)
         if name == "get_transactions":
             return _do_transactions(label, arguments)
+        if name == "list_statements":
+            return _do_list_statements(label)
+        if name == "get_statement":
+            return _do_get_statement(label, arguments)
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except OrdernetSecurityError as e:
         # Should be impossible at runtime; if it ever happens we want a
@@ -455,6 +505,49 @@ def _do_transactions(label: str | None, arguments: dict) -> list[TextContent]:
             "```",
             "",
         ])
+    return [TextContent(type="text", text="\n".join(sections).rstrip())]
+
+
+def _do_list_statements(label: str | None) -> list[TextContent]:
+    sections: list[str] = []
+    for r in _resolve_many(label):
+        stmts = r.client.list_statements(r.spark_account)
+        monthly = [f"{st.year}-{st.month:02d}" for st in stmts if st.kind == "Statement"]
+        other = [f"{st.kind} {st.year}" for st in stmts if st.kind != "Statement"]
+        sections.append(f"### {r.label} ({r.account_number})")
+        sections.append(f"- monthly statements: {', '.join(monthly) if monthly else '(none)'}")
+        if other:
+            sections.append(f"- other reports (not downloadable here): {', '.join(other)}")
+        sections.append("")
+    return [TextContent(type="text", text="\n".join(sections).rstrip())]
+
+
+def _do_get_statement(label: str | None, arguments: dict) -> list[TextContent]:
+    try:
+        year, month = int(arguments["year"]), int(arguments["month"])
+    except (KeyError, TypeError, ValueError):
+        raise OrdernetError("year and month are required integers")
+    include_text = arguments.get("include_text", True) is not False
+    sections: list[str] = []
+    for r in _resolve_many(label):
+        stmts = r.client.list_statements(r.spark_account)
+        st = next((x for x in stmts if x.kind == "Statement" and (x.year, x.month) == (year, month)), None)
+        sections.append(f"### {r.label} ({r.account_number}) {year}-{month:02d}")
+        if st is None:
+            sections.append("(no statement for that month yet)")
+            continue
+        summary = parse_statement(r.client.download_statement(r.spark_account, st))
+        sections.append(f"- as of {summary.as_of or '?'}: total {_fmt_ils(summary.total_ils)}")
+        sections.extend([
+            "",
+            "```json",
+            json.dumps({"label": r.label, "account_number": r.account_number, "year": year, "month": month,
+                        "as_of": summary.as_of, "total_ils": summary.total_ils}, ensure_ascii=False, indent=2),
+            "```",
+        ])
+        if include_text:
+            sections.extend(["", "Statement text:", "```", summary.text.strip(), "```"])
+        sections.append("")
     return [TextContent(type="text", text="\n".join(sections).rstrip())]
 
 
