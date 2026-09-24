@@ -423,3 +423,58 @@ def test_pull_all_balances_falls_back_to_single_account(monkeypatch):
     out = pull_all_balances(cfg)
     assert out[0]["balance_ils"] == 999.0
     assert out[0]["matched_account"]["number"] == "1111111111"
+
+
+# ============================== transaction history
+
+
+def _new_tx_row(d, action, desc, cur, amount, seq, fee=0.0, cash_after=1000.0):
+    """A GetNewAccountTransactions row with only the fields we map (fake data)."""
+    return {"_t": "NewStructAccountTransaction", "c": f"{d}T00:00:00", "h": action,
+            "i": action + " detail", "f": desc, "k": cur, "l": 1.0, "m": 100.0,
+            "n": amount, "o": fee, "t": cash_after, "z1": seq}
+
+
+def test_new_transactions_path_is_allowlisted():
+    assert "Account/GetNewAccountTransactions" in _ALLOWED_GET_PATHS
+
+
+def test_get_transaction_history_splits_by_calendar_year_and_parses(monkeypatch):
+    """Spark truncates ranges that cross a year, so one request per year."""
+    from datetime import date
+    c = OrdernetReadOnlyClient("meitav")
+    c._token = "x"
+    calls = []
+    by_year = {
+        "2025": [_new_tx_row("2025-12-20", "העברה", "bank", "שקל חדש", 1500.0, 2),
+                 _new_tx_row("2025-12-20", "הפקדה", "מגן מס", "שקל חדש", 0.0, 1)],
+        "2026": [_new_tx_row("2026-01-10", "ק/רצף", "SOME ETF", "שקל חדש", -1400.0, 1, fee=3.5)],
+    }
+
+    def fake_get(url, params=None, **kw):
+        calls.append((url.rsplit("/api/", 1)[-1], params["startDate"], params["endDate"]))
+        return _mock_response(200, by_year[params["startDate"][:4]])
+
+    monkeypatch.setattr(c._session, "get", fake_get)
+    acc = Account(key="ACC_000-1", number="1", name="x")
+    txns = c.get_transaction_history(acc, date(2025, 12, 1), date(2026, 2, 15))
+
+    assert calls == [
+        ("Account/GetNewAccountTransactions", "2025-12-01T00:00:00.000Z", "2025-12-31T00:00:00.000Z"),
+        ("Account/GetNewAccountTransactions", "2026-01-01T00:00:00.000Z", "2026-02-15T00:00:00.000Z"),
+    ]
+    assert [(t.date, t.action, t.amount) for t in txns] == [
+        ("2025-12-20", "הפקדה", 0.0),      # sorted by Spark's sequence within the day
+        ("2025-12-20", "העברה", 1500.0),
+        ("2026-01-10", "ק/רצף", -1400.0),
+    ]
+    assert txns[2].fee == 3.5 and txns[2].currency == "שקל חדש"
+    assert [t.is_cash_movement for t in txns] == [False, True, False]
+
+
+def test_get_transaction_history_rejects_reversed_range():
+    from datetime import date
+    c = OrdernetReadOnlyClient("meitav")
+    c._token = "x"
+    with pytest.raises(ValueError):
+        c.get_transaction_history(Account(key="k", number="1", name=""), date(2026, 2, 1), date(2026, 1, 1))

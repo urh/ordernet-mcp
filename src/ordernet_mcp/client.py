@@ -24,7 +24,9 @@ Endpoints in scope (all read):
 - ``Account/GetAccountSecurities`` - cash + securities + equity totals
 - ``Account/GetHoldings``      - per-instrument positions
 - ``Account/GetHoldingsSummery`` [sic, Spark API typo] - by-class summary
-- ``Account/GetAccountTransactions`` - historical transactions
+- ``Account/GetAccountTransactions`` - historical transactions (raw)
+- ``Account/GetNewAccountTransactions`` - transaction history as the
+  web UI shows it (currency, signed amount, cash balance after)
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import os
 from pathlib import Path
 from typing import Any
@@ -57,6 +59,7 @@ _ALLOWED_GET_PATHS = frozenset({
     "Account/GetHoldings",
     "Account/GetHoldingsSummery",
     "Account/GetAccountTransactions",
+    "Account/GetNewAccountTransactions",
 })
 
 # The only POST we ever issue. Inlined in `authenticate`; not callable
@@ -150,6 +153,76 @@ class Holding:
         if not self.cost_basis_ils or not self.quantity:
             return None
         return self.cost_basis_ils / self.quantity
+
+
+# Actions that move money into or out of the account (as opposed to
+# trades, dividends, fees and interest). Spark also books internal
+# tax-shield entries ("מגן מס", "מס לשלם") under these actions with a
+# zero amount - ``Transaction.is_cash_movement`` skips those.
+_CASH_MOVEMENT_ACTIONS = frozenset({"הפקדה", "משיכה", "העברה"})
+
+
+@dataclass(frozen=True)
+class Transaction:
+    """One row of ``GetNewAccountTransactions`` - the history the web UI shows.
+
+    Field mapping (NewStructAccountTransaction, verified against live
+    Meitav responses):
+
+    - ``date`` <- ``c`` (YYYY-MM-DD)
+    - ``action`` <- ``h``, short action code, e.g. "הפקדה", "העברה",
+      "ק/רצף" (buy), "מ/חול" (foreign sell), "הפ/דיב" (dividend)
+    - ``action_detail`` <- ``i``, long form, e.g. "העברה מזומן בשח"
+    - ``description`` <- ``f``, security name or transfer reference
+    - ``currency`` <- ``k``, e.g. "שקל חדש", "דולר ארה\"ב"
+    - ``quantity`` <- ``l``; ``price`` <- ``m`` (as Spark reports it -
+      agorot for TASE securities, FX rate x100 for conversions)
+    - ``amount`` <- ``n``, signed, in ``currency``: + into the cash pool,
+      - out of it
+    - ``fee`` <- ``o``, commission (on interest rows: the withholding)
+    - ``cash_balance_ils`` <- ``t``, ILS cash balance after the row
+    """
+
+    date: str
+    action: str
+    action_detail: str
+    description: str
+    currency: str
+    quantity: float
+    price: float
+    amount: float
+    fee: float
+    cash_balance_ils: float
+    raw: dict[str, Any]
+
+    @property
+    def is_cash_movement(self) -> bool:
+        """Money deposited, withdrawn or transferred - not a trade."""
+        return self.action in _CASH_MOVEMENT_ACTIONS and self.amount != 0
+
+
+def _num(row: dict[str, Any], key: str) -> float:
+    v = row.get(key)
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_transaction(row: dict[str, Any]) -> Transaction:
+    return Transaction(
+        date=str(row.get("c") or "")[:10],
+        action=str(row.get("h") or "").strip(),
+        action_detail=str(row.get("i") or "").strip(),
+        description=str(row.get("f") or "").strip(),
+        currency=str(row.get("k") or "").strip(),
+        quantity=_num(row, "l"),
+        price=_num(row, "m"),
+        amount=_num(row, "n"),
+        fee=_num(row, "o"),
+        cash_balance_ils=_num(row, "t"),
+        raw=row,
+    )
 
 
 class OrdernetReadOnlyClient:
@@ -400,6 +473,40 @@ class OrdernetReadOnlyClient:
                 f"GetAccountTransactions returned non-list: {type(data).__name__}"
             )
         return data
+
+    def get_transaction_history(
+        self,
+        account: Account,
+        start: date,
+        end: date,
+    ) -> list[Transaction]:
+        """Transaction history in [start, end], oldest first.
+
+        Uses the endpoint behind the web UI's history screen. A range that
+        crosses a calendar year comes back truncated, so this issues one
+        request per calendar year and merges them."""
+        if end < start:
+            raise ValueError(f"end {end} is before start {start}")
+        out: list[Transaction] = []
+        for year in range(start.year, end.year + 1):
+            s = max(start, date(year, 1, 1))
+            e = min(end, date(year, 12, 31))
+            data = self._get(
+                "Account/GetNewAccountTransactions",
+                {
+                    "accountKey": account.key,
+                    "startDate": f"{s.isoformat()}T00:00:00.000Z",
+                    "endDate": f"{e.isoformat()}T00:00:00.000Z",
+                },
+            )
+            if not isinstance(data, list):
+                raise OrdernetError(
+                    f"GetNewAccountTransactions returned non-list: {type(data).__name__}"
+                )
+            out.extend(_parse_transaction(r) for r in data)
+        # ``z1`` is Spark's running sequence number within the response.
+        out.sort(key=lambda t: (t.date, _num(t.raw, "z1")))
+        return out
 
 
 # ---------------------------------------------------------- credentials helpers

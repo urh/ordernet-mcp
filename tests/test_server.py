@@ -25,6 +25,7 @@ from ordernet_mcp.client import (
     Holding,
     OrdernetReadOnlyClient,
     SecuritiesTotals,
+    Transaction,
 )
 
 
@@ -35,10 +36,10 @@ def _run(coro):
 # =========================================================== surface invariants
 
 
-def test_tool_names_are_exactly_the_three_read_tools():
+def test_tool_names_are_exactly_the_four_read_tools():
     tools = _run(ordernet_mcp.list_tools())
     names = sorted(t.name for t in tools)
-    assert names == ["get_current_stocks", "get_total_amount", "get_total_cash"], names
+    assert names == ["get_current_stocks", "get_total_amount", "get_total_cash", "get_transactions"], names
 
 
 def test_tool_descriptions_advertise_read_only():
@@ -118,6 +119,13 @@ def stub_spark(monkeypatch):
             portfolio_pct=pct, asset_class=cls, raw={},
         )
 
+    def _tx(d, action, desc, cur, amount, fee=0.0):
+        return Transaction(
+            date=d, action=action, action_detail=action, description=desc,
+            currency=cur, quantity=0.0, price=0.0, amount=amount, fee=fee,
+            cash_balance_ils=1000.0, raw={},
+        )
+
     fixtures = {
         "1111111111": {
             "totals": _t(15000.0, 1875000.0, withdraw=14000.0),
@@ -135,6 +143,13 @@ def stub_spark(monkeypatch):
         "3333333333": {
             "totals": _t(84000.0, 1284000.0, withdraw=80000.0),
             "holdings": [],  # joint account holds only cash here
+            "txns": [
+                _tx("2025-11-02", "העברה", "bank transfer", "שקל חדש", 10000.0),
+                _tx("2026-01-15", "הפקדה", "00000001", 'דולר ארה"ב', 5000.0),
+                _tx("2026-01-16", "ק/רצף", "SOME ETF", "שקל חדש", -9000.0, fee=9.0),
+                _tx("2026-01-31", "הפקדה", "מגן מס", "שקל חדש", 0.0),
+                _tx("2026-02-01", "העברה", "bank transfer", "שקל חדש", -2500.0),
+            ],
         },
     }
 
@@ -145,6 +160,7 @@ def stub_spark(monkeypatch):
         client = MagicMock(spec=OrdernetReadOnlyClient)
         client.get_securities.return_value = f["totals"]
         client.get_holdings.return_value = f["holdings"]
+        client.get_transaction_history.return_value = f.get("txns", [])
 
         spark_account = Account(
             key=f"ACC_001-{num}",
@@ -230,9 +246,8 @@ def test_unknown_tool_returns_error(fake_creds, stub_spark):
 
 
 def test_call_tool_does_not_invoke_get_transactions(fake_creds, stub_spark):
-    """We exposed get_transactions on the client (might want it later
-    for the monthly refresh) but did NOT expose it via MCP. None of
-    the three tools should call it."""
+    """History goes through the typed ``get_transaction_history``; the raw
+    ``get_transactions`` stays client-only. No tool should call it."""
     out = _run(ordernet_mcp.call_tool("get_total_amount", {}))
     out2 = _run(ordernet_mcp.call_tool("get_total_cash", {}))
     out3 = _run(ordernet_mcp.call_tool("get_current_stocks", {}))
@@ -254,3 +269,53 @@ def test_module_has_main_for_python_dash_m():
     invocation)."""
     assert hasattr(ordernet_mcp, "main")
     assert callable(ordernet_mcp.main)
+
+
+# =========================================================== transaction history
+
+
+def _payload(text):
+    return json.loads(text.split("```json")[1].split("```")[0])
+
+
+def test_get_transactions_cash_movements_only(fake_creds, stub_spark):
+    out = _run(ordernet_mcp.call_tool("get_transactions", {
+        "account_label": "joint", "start_date": "2025-01-01",
+        "end_date": "2026-03-01", "cash_movements_only": True,
+    }))
+    p = _payload(out[0].text)
+    kinds = [(t["date"], t["action"]) for t in p["transactions"]]
+    # The buy and the zero-amount tax-shield row are not cash movements.
+    assert kinds == [("2025-11-02", "העברה"), ("2026-01-15", "הפקדה"), ("2026-02-01", "העברה")]
+    assert p["cash_movements"]["שקל חדש"] == {"in": 10000.0, "out": -2500.0}
+    assert p["cash_movements"]['דולר ארה"ב'] == {"in": 5000.0, "out": 0.0}
+
+
+def test_get_transactions_passes_the_range_to_the_client(fake_creds, stub_spark):
+    captured = {}
+    orig = ordernet_mcp._resolve_one
+
+    def spy(broker, acc_cfg):
+        r = orig(broker, acc_cfg)
+        captured[r.label] = r.client
+        return r
+
+    ordernet_mcp._resolve_one = spy
+    try:
+        out = _run(ordernet_mcp.call_tool("get_transactions", {
+            "account_label": "joint", "start_date": "2025-06-01", "end_date": "2026-02-01",
+        }))
+    finally:
+        ordernet_mcp._resolve_one = orig
+    from datetime import date
+    args = captured["joint"].get_transaction_history.call_args.args
+    assert args[1:] == (date(2025, 6, 1), date(2026, 2, 1))
+    assert len(_payload(out[0].text)["transactions"]) == 5
+
+
+def test_get_transactions_rejects_bad_dates(fake_creds, stub_spark):
+    bad = _run(ordernet_mcp.call_tool("get_transactions", {"start_date": "01/02/2026"}))
+    assert "Ordernet error" in bad[0].text and "YYYY-MM-DD" in bad[0].text
+    rev = _run(ordernet_mcp.call_tool("get_transactions", {
+        "start_date": "2026-05-01", "end_date": "2026-01-01"}))
+    assert "before start_date" in rev[0].text

@@ -1,10 +1,12 @@
 """Read-only Ordernet MCP server (stdio).
 
-Exposes three read tools backed by ``bot.ordernet.OrdernetReadOnlyClient``:
+Exposes four read tools backed by ``bot.ordernet.OrdernetReadOnlyClient``:
 
 - ``get_total_amount`` - total equity (cash + securities) per account
 - ``get_total_cash``   - just the NIS cash balance
 - ``get_current_stocks`` - per-instrument holdings
+- ``get_transactions`` - transaction history (deposits, transfers,
+  trades, dividends, fees) for a date range
 
 What this server does NOT do, and is structurally incapable of doing:
 
@@ -30,6 +32,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -44,6 +47,7 @@ from ordernet_mcp.client import (
     OrdernetReadOnlyClient,
     OrdernetSecurityError,
     SecuritiesTotals,
+    Transaction,
     load_credentials,
 )
 
@@ -213,6 +217,40 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="get_transactions",
+            description=(
+                "READ-ONLY. Transaction history per Ordernet/Spark account "
+                "for a date range: deposits, withdrawals and bank "
+                "transfers, trades, currency conversions, dividends, fees "
+                "and interest. Each row has the date, action, description, "
+                "currency, signed amount (+ into the account, - out) and the "
+                "ILS cash balance after it. Use cash_movements_only to see "
+                "just the money that came in or went out - e.g. to find "
+                "when a large deposit arrived."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "account_label": {
+                        "type": "string",
+                        "description": _LABEL_DESCRIPTION,
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "YYYY-MM-DD. Defaults to January 1 of the current year.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "YYYY-MM-DD. Defaults to today.",
+                    },
+                    "cash_movements_only": {
+                        "type": "boolean",
+                        "description": "Only deposits, withdrawals and transfers (no trades, dividends or fees).",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -226,6 +264,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _do_total_cash(label)
         if name == "get_current_stocks":
             return _do_current_stocks(label)
+        if name == "get_transactions":
+            return _do_transactions(label, arguments)
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except OrdernetSecurityError as e:
         # Should be impossible at runtime; if it ever happens we want a
@@ -337,6 +377,84 @@ def _do_current_stocks(label: str | None) -> list[TextContent]:
         sections.append(json.dumps({"label": r.label, "account_number": r.account_number, "holdings": rows}, ensure_ascii=False, indent=2))
         sections.append("```")
         sections.append("")
+    return [TextContent(type="text", text="\n".join(sections).rstrip())]
+
+
+_MAX_HISTORY_YEARS = 10
+
+
+def _parse_date_arg(arguments: dict, key: str, default: date) -> date:
+    v = arguments.get(key)
+    if not v:
+        return default
+    try:
+        return date.fromisoformat(str(v).strip()[:10])
+    except ValueError:
+        raise OrdernetError(f"{key} must be YYYY-MM-DD, got {v!r}")
+
+
+def _serialize_transaction(t: Transaction) -> dict:
+    return {
+        "date": t.date,
+        "action": t.action,
+        "action_detail": t.action_detail,
+        "description": t.description,
+        "currency": t.currency,
+        "quantity": t.quantity,
+        "price": t.price,
+        "amount": t.amount,
+        "fee": t.fee,
+        "cash_balance_ils": t.cash_balance_ils,
+        "is_cash_movement": t.is_cash_movement,
+    }
+
+
+def _do_transactions(label: str | None, arguments: dict) -> list[TextContent]:
+    today = date.today()
+    start = _parse_date_arg(arguments, "start_date", date(today.year, 1, 1))
+    end = _parse_date_arg(arguments, "end_date", today)
+    if end < start:
+        raise OrdernetError(f"end_date {end} is before start_date {start}")
+    if end.year - start.year >= _MAX_HISTORY_YEARS:
+        raise OrdernetError(f"range too long; ask for at most {_MAX_HISTORY_YEARS} calendar years")
+    only_cash = bool(arguments.get("cash_movements_only"))
+
+    sections: list[str] = []
+    for r in _resolve_many(label):
+        txns = r.client.get_transaction_history(r.spark_account, start, end)
+        if only_cash:
+            txns = [t for t in txns if t.is_cash_movement]
+        sections.append(f"### {r.label} ({r.account_number}) {start} -> {end}")
+        if not txns:
+            sections.append("(no transactions)")
+        for t in txns:
+            fee_s = f", fee {t.fee:,.2f}" if t.fee else ""
+            sections.append(
+                f"- {t.date} {t.action} | {t.description} | "
+                f"{t.amount:+,.2f} {t.currency}{fee_s} | cash after {_fmt_ils(t.cash_balance_ils)}"
+            )
+        # Money in / out per currency - the question this tool usually answers.
+        flows: dict[str, dict[str, float]] = {}
+        for t in txns:
+            if t.is_cash_movement:
+                f = flows.setdefault(t.currency, {"in": 0.0, "out": 0.0})
+                f["in" if t.amount > 0 else "out"] += t.amount
+        for cur, f in flows.items():
+            sections.append(f"  -- cash movements {cur}: in {f['in']:+,.2f}, out {f['out']:+,.2f}")
+        sections.extend([
+            "",
+            "```json",
+            json.dumps({
+                "label": r.label,
+                "account_number": r.account_number,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "cash_movements": flows,
+                "transactions": [_serialize_transaction(t) for t in txns],
+            }, ensure_ascii=False, indent=2),
+            "```",
+            "",
+        ])
     return [TextContent(type="text", text="\n".join(sections).rstrip())]
 
 
