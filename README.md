@@ -11,8 +11,9 @@ Connect an AI assistant (Cursor, Claude Desktop, etc.) to your brokerage account
 - *"What is my total portfolio value across all accounts?"*
 - *"How much cash do I have available to invest?"*
 - *"List my current stock and ETF holdings with market values."*
+- *"When did that large deposit arrive, and how much did we transfer in this year?"*
 
-The server is **read-only by construction**: it can authenticate and fetch balances and holdings, but cannot place trades, cancel orders, or move money. Every HTTP path goes through an explicit allowlist enforced in code and tests.
+The server is **read-only by construction**: it can authenticate and fetch balances, holdings and transaction history, but cannot place trades, cancel orders, or move money. Every HTTP path goes through an explicit allowlist enforced in code and tests.
 
 ## Tools
 
@@ -21,8 +22,9 @@ The server is **read-only by construction**: it can authenticate and fetch balan
 | `get_total_amount` | Total portfolio equity (cash + securities) in ILS |
 | `get_total_cash` | NIS cash balance only |
 | `get_current_stocks` | Per-instrument holdings with quantities and values |
+| `get_transactions` | Transaction history for a date range — deposits, transfers, trades, conversions, dividends, fees — with signed amounts and the cash balance after each row. `cash_movements_only` narrows it to money in / out |
 
-All tools accept an optional `account_label` to filter to one account from your credentials file.
+All tools accept an optional `account_label` to filter to one account from your credentials file. `get_transactions` also takes `start_date` / `end_date` (YYYY-MM-DD; default: January 1 → today).
 
 ## Setup
 
